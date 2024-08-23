@@ -209,7 +209,7 @@ pub trait EvalContextExt<'tcx>: MiriInterpCxExt<'tcx> {
         this.memory.alloc_map().iter(|it| {
             for (_id, (_kind, alloc)) in it {
                 if let Some(bt) = &alloc.extra.borrow_tracker {
-                    bt.remove_unreachable_tags(&tags);
+                    bt.remove_unreachable_tags(&tags, &this.machine);
                 }
             }
         });

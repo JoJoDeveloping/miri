@@ -747,8 +747,8 @@ impl<'tcx> Tree {
 
 /// Integration with the BorTag garbage collector
 impl Tree {
-    pub fn remove_unreachable_tags(&mut self, live_tags: &FxHashSet<BorTag>) {
-        self.remove_useless_children(self.root, live_tags);
+    pub fn remove_unreachable_tags(&mut self, live_tags: &FxHashSet<BorTag>, global: &GlobalState) {
+        self.remove_useless_children(self.root, live_tags, global);
         // Right after the GC runs is a good moment to check if we can
         // merge some adjacent ranges that were made equal by the removal of some
         // tags (this does not necessarily mean that they have identical internal representations,
@@ -761,6 +761,60 @@ impl Tree {
     fn is_useless(&self, idx: UniIndex, live: &FxHashSet<BorTag>) -> bool {
         let node = self.nodes.get(idx).unwrap();
         node.children.is_empty() && !live.contains(&node.tag)
+    }
+
+    fn can_be_replaced_by_single_child(
+        &self,
+        idx: UniIndex,
+        live: &FxHashSet<BorTag>,
+        global: &GlobalState,
+    ) -> Option<UniIndex> {
+        let node = self.nodes.get(idx).unwrap();
+        if node.children.len() != 1
+            || live.contains(&node.tag)
+            || node.parent.is_none()
+            || global.borrow().protected_tags.contains_key(&node.tag)
+        {
+            return None;
+        }
+        let child_idx = node.children[0];
+        let child = self.nodes.get(child_idx).unwrap();
+        if global.borrow().protected_tags.contains_key(&child.tag) {
+            // todo think really hard whether we can't just handle this as we would regularly
+            return None;
+        }
+        for (_, data) in self.rperms.iter_all() {
+            let parent_perm =
+                data.get(idx).map(|x| x.permission).unwrap_or_else(|| node.default_initial_perm);
+            let child_perm = data
+                .get(child_idx)
+                .map(|x| x.permission)
+                .unwrap_or_else(|| child.default_initial_perm);
+            if !parent_perm.can_be_replaced_by_child(child_perm) {
+                return None;
+            }
+        }
+
+        Some(child_idx)
+    }
+
+    /// Properly removes a node.
+    /// The node to be removed should not otherwise be usable. It also
+    /// should have no children, but this is not checked, so that nodes
+    /// whose children were rotated somewhere else can be deleted without
+    /// having to first modify them to clear that array.
+    /// otherwise (i.e. the GC should have marked it as removable).
+    fn remove_useless_node(&mut self, this: UniIndex) {
+        // Due to the API of UniMap we must make sure to call
+        // `UniValMap::remove` for the key of this node on *all* maps that used it
+        // (which are `self.nodes` and every range of `self.rperms`)
+        // before we can safely apply `UniKeyMap::remove` to truly remove
+        // this tag from the `tag_mapping`.
+        let node = self.nodes.remove(this).unwrap();
+        for (_perms_range, perms) in self.rperms.iter_mut_all() {
+            perms.remove(this);
+        }
+        self.tag_mapping.remove(&node.tag);
     }
 
     /// Traverses the entire tree looking for useless tags.
@@ -776,7 +830,12 @@ impl Tree {
     /// `child: Reserved`. This tree can exist. If we blindly delete `parent` and reassign
     /// `child` to be a direct child of `root` then Writes to `child` are now permitted
     /// whereas they were not when `parent` was still there.
-    fn remove_useless_children(&mut self, root: UniIndex, live: &FxHashSet<BorTag>) {
+    fn remove_useless_children(
+        &mut self,
+        root: UniIndex,
+        live: &FxHashSet<BorTag>,
+        global: &GlobalState,
+    ) {
         // To avoid stack overflows, we roll our own stack.
         // Each element in the stack consists of the current tag, and the number of the
         // next child to be processed.
@@ -806,22 +865,18 @@ impl Tree {
                 // Remove all useless children.
                 children_of_node.retain_mut(|idx| {
                     if self.is_useless(*idx, live) {
-                        // Note: In the rest of this comment, "this node" refers to `idx`.
-                        // This node has no more children (if there were any, they have already been removed).
-                        // It is also unreachable as determined by the GC, so we can remove it everywhere.
-                        // Due to the API of UniMap we must make sure to call
-                        // `UniValMap::remove` for the key of this node on *all* maps that used it
-                        // (which are `self.nodes` and every range of `self.rperms`)
-                        // before we can safely apply `UniKeyMap::remove` to truly remove
-                        // this tag from the `tag_mapping`.
-                        let node = self.nodes.remove(*idx).unwrap();
-                        for (_perms_range, perms) in self.rperms.iter_mut_all() {
-                            perms.remove(*idx);
-                        }
-                        self.tag_mapping.remove(&node.tag);
-                        // now delete it
+                        // delete it everywhere else
+                        self.remove_useless_node(*idx);
+                        // and delete it from children_of_mut
                         false
                     } else {
+                        if let Some(nextchild) =
+                            self.can_be_replaced_by_single_child(*idx, live, global)
+                        {
+                            self.remove_useless_node(*idx);
+                            self.nodes.get_mut(nextchild).unwrap().parent = Some(*tag);
+                            *idx = nextchild;
+                        }
                         // do nothing, but retain
                         true
                     }

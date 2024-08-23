@@ -130,7 +130,7 @@ mod transition {
             Active =>
                 if protected {
                     // We wrote, someone else reads -- that's bad.
-                    // (If this is initialized, this move-to-protected will mean insta-UB.)
+                    // (Since Active is always initialized, this move-to-protected will mean insta-UB.)
                     Disabled
                 } else {
                     // We don't want to disable here to allow read-read reordering: it is crucial
@@ -270,6 +270,19 @@ impl Permission {
         let old_state = old_perm.inner;
         transition::perform_access(kind, rel_pos, old_state, protected)
             .map(|new_state| PermTransition { from: old_state, to: new_state })
+    }
+
+    /// During a provenance GC, we want to compact the tree.
+    /// For this, we want to merge nodes upwards if they have a singleton parent.
+    /// But we need to be careful: If the parent is Frozen, and the child is Reserved,
+    /// we can not do such a merge. In general, such a merge is possible if the parent
+    /// is not protected, and if the child is reachable from the parent. This
+    /// corresponds to the `partial_cmp` order on permissions.
+    pub fn can_be_replaced_by_child(self, child: Self) -> bool {
+        match self.inner.partial_cmp(&child.inner) {
+            Some(Ordering::Less) | Some(Ordering::Equal) => true,
+            Some(Ordering::Greater) | None => false,
+        }
     }
 }
 

@@ -128,6 +128,22 @@ impl LocationState {
         Ok(transition)
     }
 
+    /// Like `perform_access`, but ignores the diagnostics, and also is pure.
+    /// As such, it returns `Some(x)` if the transition succeeded, or `None`
+    /// if there was an error.
+    #[allow(unused)]
+    fn perform_access_no_fluff(
+        mut self,
+        access_kind: AccessKind,
+        rel_pos: AccessRelatedness,
+        protected: bool,
+    ) -> Option<Self> {
+        match self.perform_access(access_kind, rel_pos, protected) {
+            Ok(_) => Some(self),
+            Err(_) => None,
+        }
+    }
+
     // Helper to optimize the tree traversal.
     // The optimization here consists of observing thanks to the tests
     // `foreign_read_is_noop_after_foreign_write` and `all_transitions_idempotent`,

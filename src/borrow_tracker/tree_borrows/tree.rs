@@ -763,8 +763,8 @@ impl<'tcx> Tree {
 
 /// Integration with the BorTag garbage collector
 impl Tree {
-    pub fn remove_unreachable_tags(&mut self, live_tags: &FxHashSet<BorTag>, global: &GlobalState) {
-        self.remove_useless_children(self.root, live_tags, global);
+    pub fn remove_unreachable_tags(&mut self, live_tags: &FxHashSet<BorTag>) {
+        self.remove_useless_children(self.root, live_tags);
         // Right after the GC runs is a good moment to check if we can
         // merge some adjacent ranges that were made equal by the removal of some
         // tags (this does not necessarily mean that they have identical internal representations,
@@ -779,26 +779,23 @@ impl Tree {
         node.children.is_empty() && !live.contains(&node.tag)
     }
 
+    /// Checks whether a node can be replaced by its only child.
+    /// If so, returns the index of said only child.
+    /// If not, returns none.
     fn can_be_replaced_by_single_child(
         &self,
         idx: UniIndex,
         live: &FxHashSet<BorTag>,
-        global: &GlobalState,
     ) -> Option<UniIndex> {
         let node = self.nodes.get(idx).unwrap();
-        if node.children.len() != 1
-            || live.contains(&node.tag)
-            || node.parent.is_none()
-            || global.borrow().protected_tags.contains_key(&node.tag)
-        {
+        if node.children.len() != 1 || live.contains(&node.tag) || node.parent.is_none() {
             return None;
         }
+        // Since protected nodes are never GC'd (see `borrow_tracker::GlobalStateInner::visit_provenance`),
+        // we know that `node` is not protected because otherwise `live` would
+        // have contained `node.tag`.
         let child_idx = node.children[0];
         let child = self.nodes.get(child_idx).unwrap();
-        if global.borrow().protected_tags.contains_key(&child.tag) {
-            // todo think really hard whether we can't just handle this as we would regularly
-            return None;
-        }
         for (_, data) in self.rperms.iter_all() {
             let parent_perm =
                 data.get(idx).map(|x| x.permission).unwrap_or_else(|| node.default_initial_perm);
@@ -846,12 +843,7 @@ impl Tree {
     /// `child: Reserved`. This tree can exist. If we blindly delete `parent` and reassign
     /// `child` to be a direct child of `root` then Writes to `child` are now permitted
     /// whereas they were not when `parent` was still there.
-    fn remove_useless_children(
-        &mut self,
-        root: UniIndex,
-        live: &FxHashSet<BorTag>,
-        global: &GlobalState,
-    ) {
+    fn remove_useless_children(&mut self, root: UniIndex, live: &FxHashSet<BorTag>) {
         // To avoid stack overflows, we roll our own stack.
         // Each element in the stack consists of the current tag, and the number of the
         // next child to be processed.
@@ -883,17 +875,18 @@ impl Tree {
                     if self.is_useless(*idx, live) {
                         // delete it everywhere else
                         self.remove_useless_node(*idx);
-                        // and delete it from children_of_mut
+                        // and delete it from children_of_node
                         false
                     } else {
-                        if let Some(nextchild) =
-                            self.can_be_replaced_by_single_child(*idx, live, global)
-                        {
+                        if let Some(nextchild) = self.can_be_replaced_by_single_child(*idx, live) {
+                            // delete the in-between child
                             self.remove_useless_node(*idx);
+                            // set the new child's parent
                             self.nodes.get_mut(nextchild).unwrap().parent = Some(*tag);
+                            // save the new child in children_of_node
                             *idx = nextchild;
                         }
-                        // do nothing, but retain
+                        // retain it
                         true
                     }
                 });

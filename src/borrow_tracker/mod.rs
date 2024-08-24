@@ -468,16 +468,10 @@ impl AllocState {
         }
     }
 
-    pub fn remove_unreachable_tags<'tcx>(
-        &self,
-        tags: &FxHashSet<BorTag>,
-        machine: &MiriMachine<'tcx>,
-    ) {
+    pub fn remove_unreachable_tags(&self, tags: &FxHashSet<BorTag>) {
         match self {
             AllocState::StackedBorrows(sb) => sb.borrow_mut().remove_unreachable_tags(tags),
-            AllocState::TreeBorrows(tb) =>
-                tb.borrow_mut()
-                    .remove_unreachable_tags(tags, machine.borrow_tracker.as_ref().unwrap()),
+            AllocState::TreeBorrows(tb) => tb.borrow_mut().remove_unreachable_tags(tags),
         }
     }
 

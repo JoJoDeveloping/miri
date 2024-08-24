@@ -272,11 +272,15 @@ impl Permission {
     /// For this, we want to merge nodes upwards if they have a singleton parent.
     /// But we need to be careful: If the parent is Frozen, and the child is Reserved,
     /// we can not do such a merge. In general, such a merge is possible if the parent
-    /// is not protected, and if the child is reachable from the parent. This
-    /// corresponds to the `partial_cmp` order on permissions.
+    /// allows similar accesses, and in particular if the parent never causes UB on its
+    /// own. This is enforced by a test, namely `tree_compacting_is_sound`. See that
+    /// test for more information.
+    /// This method is only sound if the parent is not protected. We never attempt to
+    /// remove protected parents.
     pub fn can_be_replaced_by_child(self, child: Self) -> bool {
         match (self.inner, child.inner) {
-            // ReservedIM can be replaced by anything
+            // ReservedIM can be replaced by anything, as it allows all
+            // transitions.
             (ReservedIM, _) => true,
             // Reserved (as parent, where conflictedness does not matter)
             // can be replaced by all but ReservedIM,

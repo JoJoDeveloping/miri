@@ -275,9 +275,29 @@ impl Permission {
     /// is not protected, and if the child is reachable from the parent. This
     /// corresponds to the `partial_cmp` order on permissions.
     pub fn can_be_replaced_by_child(self, child: Self) -> bool {
-        match self.inner.partial_cmp(&child.inner) {
-            Some(Ordering::Less) | Some(Ordering::Equal) => true,
-            Some(Ordering::Greater) | None => false,
+        match (self.inner, child.inner) {
+            // ReservedIM can be replaced by anything
+            (ReservedIM, _) => true,
+            // Reserved (as parent, where conflictedness does not matter)
+            // can be replaced by all but ReservedIM,
+            // since ReservedIM alone would survive foreign writes
+            (ReservedFrz { .. }, ReservedIM) => false,
+            (ReservedFrz { .. }, _) => true,
+            // Active can not be replaced by something surviving
+            // foreign reads and then remaining writable
+            (Active, ReservedIM) => false,
+            (Active, ReservedFrz { .. }) => false,
+            (Active, Active) => true,
+            // Active can be replaced by Frozen, since it is not protected
+            (Active, Frozen) => true,
+            (Active, Disabled) => true,
+            // Frozen can only be replaced by Disabled
+            (Frozen, Frozen) => true,
+            (Frozen, Disabled) => true,
+            (Frozen, _) => false,
+            // Disabled can not be replaced by anything else
+            (Disabled, Disabled) => true,
+            (Disabled, _) => false,
         }
     }
 }

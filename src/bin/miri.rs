@@ -26,6 +26,7 @@ extern crate rustc_target;
 use std::env::{self, VarError};
 use std::num::NonZero;
 use std::path::PathBuf;
+use std::process;
 use std::str::FromStr;
 
 use tracing::debug;
@@ -53,6 +54,8 @@ use rustc_span::def_id::DefId;
 use rustc_target::spec::abi::Abi;
 
 use miri::{BacktraceStyle, BorrowTrackerMethod, ProvenanceMode, RetagFields, ValidationMode};
+
+pub const GIT_HASH: &'static str = env!("GIT_HASH");
 
 struct MiriCompilerCalls {
     miri_config: miri::MiriConfig,
@@ -542,6 +545,9 @@ fn main() {
             miri_config.provenance_mode = ProvenanceMode::Permissive;
         } else if arg == "-Zmiri-mute-stdout-stderr" {
             miri_config.mute_stdout_stderr = true;
+        } else if arg == "-Zmiri-version" {
+            println!("Your version of miri is based on git {}!", GIT_HASH);
+            process::exit(0)
         } else if arg == "-Zmiri-retag-fields" {
             miri_config.retag_fields = RetagFields::Yes;
         } else if let Some(retag_fields) = arg.strip_prefix("-Zmiri-retag-fields=") {

@@ -300,6 +300,11 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         )?;
         // Record the parent-child pair in the tree.
         tree_borrows.new_child(orig_tag, new_tag, new_perm.initial_state, range, span)?;
+        tree_borrows.update_last_accessed_after_reborrow(
+            new_tag,
+            new_perm.initial_state,
+            new_perm.protector.is_some(),
+        );
         drop(tree_borrows);
 
         // Also inform the data race model (but only if any bytes are actually affected).

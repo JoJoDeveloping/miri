@@ -240,6 +240,49 @@ impl LocationState {
             self.latest_foreign_access = None;
         }
     }
+
+    /// See `reset_last_foreign_access_after_reborrow`
+    pub fn foreign_access_requires_update(
+        last_recorded: Option<AccessKind>,
+        happening_now: Option<AccessKind>,
+    ) -> bool {
+        match (last_recorded, happening_now) {
+            // if the last access here was a child access, we need to do nothing
+            (None, _) => false,
+            // if the last access here was a foreign access, but our new child does not
+            // survive any foreign access, we must let the next foreign access through again
+            (_, None) => true,
+            // last access was a read, the child survives reads -> no change needed
+            (Some(AccessKind::Read), Some(AccessKind::Read)) => false,
+            // last access was a read, the child survives writes -> no change needed
+            (Some(AccessKind::Read), Some(AccessKind::Write)) => false,
+            // last access was a write, the child survives writes -> no change needed
+            (Some(AccessKind::Write), Some(AccessKind::Write)) => false,
+            // last access was a write, the child does not survive writes -> reset it to read
+            (Some(AccessKind::Write), Some(AccessKind::Read)) => true,
+        }
+    }
+
+    /// When we retag, we create lazy nodes. Those nodes can be changed by foreign
+    /// reads/writes, even if the parent node is invariant under foreign access and
+    /// the most recent action it received was such a foreign access, which would make
+    /// `skip_if_known_noop` skip the access, and thereby miss this access for the child.
+    /// So, when we create a new node, we need to reset this "last access" flag in all
+    /// parents.
+    /// This performs such a reset. It returns true if the reset was necessary. If it was not,
+    /// we can also stop visiting the parent, since the last foreign access to the parent
+    /// is at most as potent as the one recorded at the child.
+    fn reset_last_foreign_access_after_reborrow(
+        &mut self,
+        strongest_survivable: Option<AccessKind>,
+    ) -> bool {
+        let needs_update =
+            Self::foreign_access_requires_update(self.latest_foreign_access, strongest_survivable);
+        if needs_update {
+            self.latest_foreign_access = strongest_survivable;
+        }
+        needs_update
+    }
 }
 
 impl fmt::Display for LocationState {
@@ -595,6 +638,34 @@ impl<'tcx> Tree {
             perms.insert(idx, perm);
         }
         Ok(())
+    }
+
+    /// Resets the "last foreign access" cache used to speed up tree traversal after creating a new node.
+    /// This is necessary because otherwise, lazy nodes might miss foreign accesses,
+    pub fn update_last_accessed_after_reborrow(
+        &mut self,
+        child_tag: BorTag,
+        new_perm: Permission,
+        prot: bool,
+    ) {
+        let mut current = self.tag_mapping.get(&child_tag).unwrap();
+        let strongest_survivable = new_perm.strongest_survivable_foreign_action(prot);
+        // We walk the tree upwards, until we find that the last access to this node
+        while let Some(next) = self.nodes.get(current).unwrap().parent {
+            current = next;
+            let any_change = self.rperms.iter_mut_all().any(|(_, map)| {
+                match map.get_mut(current) {
+                    Some(perm) =>
+                        perm.reset_last_foreign_access_after_reborrow(strongest_survivable),
+                    None => true, // TODO optimize
+                }
+            });
+            if any_change {
+                continue;
+            } else {
+                break;
+            }
+        }
     }
 
     /// Deallocation requires

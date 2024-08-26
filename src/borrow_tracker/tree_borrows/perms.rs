@@ -87,6 +87,33 @@ impl PermissionPriv {
     fn compatible_with_protector(&self) -> bool {
         !matches!(self, ReservedIM)
     }
+
+    /// Returns the strongest foreign action this node survives (without change),
+    /// where `prot` indicates if it is protected.
+    /// They are ordered as `None` < `Some(Read)` < `Some(Write)`, in order of power.
+    pub fn strongest_survivable_foreign_action(&self, prot: bool) -> Option<AccessKind> {
+        match self {
+            ReservedFrz { conflicted } => {
+                if prot && !conflicted {
+                    // The read will make it conflicted, so it is not invariant under it.
+                    None
+                } else {
+                    // Reads do not affect it.
+                    Some(AccessKind::Read)
+                }
+            }
+            // Famously, ReservedIM survives foreign writes. It is never protected.
+            ReservedIM => Some(AccessKind::Write),
+            // Active changes on any foreign access (becomes Frozen/Disabled).
+            Active => None,
+            // Frozen survives foreign reads, but not writes.
+            Frozen => Some(AccessKind::Read),
+            // Active survives foreign reads and writes. It survives them
+            // even if protected, because a protected `Disabled` is not initialized
+            // and does therefore not trigger UB.
+            Disabled => Some(AccessKind::Write),
+        }
+    }
 }
 
 /// This module controls how each permission individually reacts to an access.
@@ -266,6 +293,12 @@ impl Permission {
         let old_state = old_perm.inner;
         transition::perform_access(kind, rel_pos, old_state, protected)
             .map(|new_state| PermTransition { from: old_state, to: new_state })
+    }
+
+    /// Returns the strongest foreign action this node survives (without change),
+    /// where `prot` indicates if it is protected.
+    pub fn strongest_survivable_foreign_action(&self, prot: bool) -> Option<AccessKind> {
+        self.inner.strongest_survivable_foreign_action(prot)
     }
 }
 

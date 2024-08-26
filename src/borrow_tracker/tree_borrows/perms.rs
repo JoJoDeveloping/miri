@@ -87,6 +87,28 @@ impl PermissionPriv {
     fn compatible_with_protector(&self) -> bool {
         !matches!(self, ReservedIM)
     }
+
+    /// Returns the strongest foreign action this node survives (without change),
+    /// where `prot` indicates if it is protected.
+    /// They are ordered as `None` < `Some(Read)` < `Some(Write)`, in order of power.
+    pub fn strongest_survivable_foreign_action(&self, prot: bool) -> Option<AccessKind> {
+        match self {
+            // The read will make it conflicted, so it is not invariant under it.
+            ReservedFrz { conflicted } if prot && !conflicted => None,
+            // Otherwise, foreign reads do not affect it
+            ReservedFrz { .. } => Some(AccessKind::Read),
+            // Famously, ReservedIM survives foreign writes. It is never protected.
+            ReservedIM => Some(AccessKind::Write),
+            // Active changes on any foreign access (becomes Frozen/Disabled).
+            Active => None,
+            // Frozen survives foreign reads, but not writes.
+            Frozen => Some(AccessKind::Read),
+            // Disabled survives foreign reads and writes. It survives them
+            // even if protected, because a protected `Disabled` is not initialized
+            // and does therefore not trigger UB.
+            Disabled => Some(AccessKind::Write),
+        }
+    }
 }
 
 /// This module controls how each permission individually reacts to an access.
@@ -304,6 +326,12 @@ impl Permission {
             (Disabled, Disabled) => true,
             (Disabled, _) => false,
         }
+    }
+
+    /// Returns the strongest foreign action this node survives (without change),
+    /// where `prot` indicates if it is protected.
+    pub fn strongest_survivable_foreign_action(&self, prot: bool) -> Option<AccessKind> {
+        self.inner.strongest_survivable_foreign_action(prot)
     }
 }
 

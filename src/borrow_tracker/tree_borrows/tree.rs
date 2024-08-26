@@ -51,6 +51,11 @@ pub(super) struct LocationState {
     /// `Some(Write)` if at least one foreign write access has been applied
     /// since the previous child access, and `Some(Read)` if at least one
     /// foreign read and no foreign write have occurred since the last child access.
+    /// It is an invariant that all children of this node have an access that is
+    /// at least as strong, if not stronger, where the strength order is:
+    /// `None` < `Some(Read)` < `Some(Write)`, and `Some(Write)` is strongest.
+    /// Further, for correctness, it is important that this is `None` when a node
+    /// is default-created.
     latest_foreign_access: Option<AccessKind>,
 }
 
@@ -143,30 +148,25 @@ impl LocationState {
         }
     }
 
-    // Helper to optimize the tree traversal.
-    // The optimization here consists of observing thanks to the tests
-    // `foreign_read_is_noop_after_foreign_write` and `all_transitions_idempotent`,
-    // that there are actually just three possible sequences of events that can occur
-    // in between two child accesses that produce different results.
-    //
-    // Indeed,
-    // - applying any number of foreign read accesses is the same as applying
-    //   exactly one foreign read,
-    // - applying any number of foreign read or write accesses is the same
-    //   as applying exactly one foreign write.
-    // therefore the three sequences of events that can produce different
-    // outcomes are
-    // - an empty sequence (`self.latest_foreign_access = None`)
-    // - a nonempty read-only sequence (`self.latest_foreign_access = Some(Read)`)
-    // - a nonempty sequence with at least one write (`self.latest_foreign_access = Some(Write)`)
-    //
-    // This function not only determines if skipping the propagation right now
-    // is possible, it also updates the internal state to keep track of whether
-    // the propagation can be skipped next time.
-    // It is a performance loss not to call this function when a foreign access occurs.
-    // FIXME: This optimization is wrong, and is currently disabled (by ignoring the
-    // result returned here). Since we presumably want an optimization like this,
-    // we should add it back. See #3864 for more information.
+    /// Tree traversal optimizations.
+    /// It turns out that all repeated accesses are idempotent, and further,
+    /// that foreign write accesses to a node are "stronger" than foreign read
+    /// accesses, insofar that a foreign read after a foreign write is a no-op.
+    /// The tests `foreign_read_is_noop_after_foreign_write` and
+    /// `all_transitions_idempotent` ensure this.
+    ///
+    /// Thus, if this access is a foreign access, and we already had such a foreign
+    /// access happen in the past, without a child access in-between, then we can
+    /// skip this access, since it is a known no-op. Further, since it is an
+    /// invariant of `latest_foreign_access` that all children survive stronger accesses,
+    /// we can not only skip this node, but the entire subtree rooted at this node.
+    ///
+    /// This method now checks whether this is the case, and the access to the entire
+    /// subtree (including this node) can be skipped.
+    /// For correctness, it is crucial that the information about the last access is
+    /// updated whenever an update occurs, using `record_new_access` or
+    /// `reset_last_foreign_access_after_reborrow`. If not, this function can cause
+    /// subtrees to be skipped that should be updated.
     fn skip_if_known_noop(
         &self,
         access_kind: AccessKind,
@@ -207,20 +207,81 @@ impl LocationState {
     }
 
     /// Records a new access, so that future access can potentially be skipped
-    /// by `skip_if_known_noop`.
-    /// The invariants for this function are closely coupled to the function above:
-    /// It MUST be called on child accesses, and on foreign accesses MUST be called
-    /// when `skip_if_know_noop` returns `Recurse`, and MUST NOT be called otherwise.
-    /// FIXME: This optimization is wrong, and is currently disabled (by ignoring the
-    /// result returned here). Since we presumably want an optimization like this,
-    /// we should add it back. See #3864 for more information.
-    #[allow(unused)]
+    /// by `skip_if_known_noop`. It needs to be called after some accesses, in order
+    /// to record this new access.
+    /// The rules for when it needs to be called are tightly coupled to `skip_if_known_noop` above:
+    /// If `skip_if_known_noop` says that a node should be visited, this function MUST be called afterwards.
+    /// If `skip_if_known_noop` says that a node (and its subtree) should be skipped, this function
+    ///   MUST NOT be called for this node (nor any of its children).
     fn record_new_access(&mut self, access_kind: AccessKind, rel_pos: AccessRelatedness) {
+        debug_assert!(matches!(
+            self.skip_if_known_noop(access_kind, rel_pos),
+            ContinueTraversal::Recurse
+        ));
         if rel_pos.is_foreign() {
             self.latest_foreign_access = Some(access_kind);
         } else {
             self.latest_foreign_access = None;
         }
+    }
+
+    /// Check if the latest recorded foreign update needs to be updated after a retag.
+    /// Retags can violate the invariant on `LocationState::latest_foreign_access`,
+    /// which states that a node's children survive accesses at least as strong as that node itself.
+    /// While retags act as a read for the offsets specified in the retag, it is also present at the other
+    /// offsets, but marked as "lazy." Such lazy nodes can, however, still be affected by foreign accesses.
+    /// This would violate the invariants that children always survive accesses at least as strong as the last
+    /// recorded foreign access at the parent.
+    /// To restore the invariant, we need to weaken the information stored in the parent, until it is weak enough
+    /// to encompass the newly added lazy node.
+    /// This function compares two accesses, and indicates if the parents needs to be updated.
+    /// It returns `true` iff `last_recorded` is stronger than `happening_now`, where
+    /// `None` is weakest and `Some(Write)` is strongest.
+    pub fn foreign_access_requires_update(
+        last_recorded: Option<AccessKind>,
+        happening_now: Option<AccessKind>,
+    ) -> bool {
+        match (last_recorded, happening_now) {
+            // if the last access here was a child access, we need to do nothing
+            (None, _) => false,
+            // if the last access here was a foreign access, but our new child does not
+            // survive any foreign access, we must let the next foreign access through again
+            (_, None) => true,
+            // last access was a read, the child survives reads -> no change needed
+            (Some(AccessKind::Read), Some(AccessKind::Read)) => false,
+            // last access was a read, the child survives writes -> no change needed
+            (Some(AccessKind::Read), Some(AccessKind::Write)) => false,
+            // last access was a write, the child survives writes -> no change needed
+            (Some(AccessKind::Write), Some(AccessKind::Write)) => false,
+            // last access was a write, the child does not survive writes -> reset it to read
+            (Some(AccessKind::Write), Some(AccessKind::Read)) => true,
+        }
+    }
+
+    /// Restores the "children are stronger" invariant of `latest_foreign_access` after a retag.
+    /// See also `foreign_access_requires_update`.
+    /// Retags can violate the invariant on `latest_foreign_access`,
+    /// which states that a node's children survive accesses at least as strong as that node itself.
+    /// While retags act as a read for the offsets specified in the retag, it is also present at the other
+    /// offsets, but marked as "lazy." Such lazy nodes can, however, still be affected by foreign accesses.
+    /// This would violate the invariants that children always survive accesses at least as strong as the last
+    /// recorded foreign access at the parent.
+    /// To restore the invariant, we need to weaken the information stored in the parent, until it is weak enough
+    /// to encompass the newly added lazy node.
+    /// This function updates the `latest_foreign_access` for this node, by weakening it if necessary.
+    /// It returns `true` if such a weakening was necessary. If this method returns `true`, then this node's parent
+    /// also needs to be updated. If it returns `false`, then the invariant is restored globally, since all of `self`'s
+    /// parents are already weaker than `self` itself.
+    fn reset_last_foreign_access_after_retag(
+        &mut self,
+        strongest_survivable: Option<AccessKind>,
+    ) -> bool {
+        let needs_update =
+            Self::foreign_access_requires_update(self.latest_foreign_access, strongest_survivable);
+        if needs_update {
+            self.latest_foreign_access = strongest_survivable;
+        }
+        needs_update
     }
 }
 
@@ -640,6 +701,56 @@ impl<'tcx> Tree {
         interp_ok(())
     }
 
+    /// Restores the "children are stronger" invariant of `latest_foreign_access` after a retag.
+    /// See also `reset_last_foreign_access_after_reborrow`.
+    /// Retags can violate the invariant on `latest_foreign_access`,
+    /// which states that a node's children survive accesses at least as strong as that node itself.
+    /// While retags act as a read for the offsets specified in the retag, it is also present at the other
+    /// offsets, but marked as "lazy." Such lazy nodes can, however, still be affected by foreign accesses.
+    /// This would violate the invariants that children always survive accesses at least as strong as the last
+    /// recorded foreign access at the parent.
+    /// To restore the invariant, we need to weaken the information stored in all parents, until it is weak enough
+    /// to encompass the newly added lazy node.
+    /// This function walks upwards from the newly inserted node, and ensures that all its parents are aware that the subtree
+    /// rooted at that parent might now survive fewer foreign accesses than it did before this node was inserted.
+    pub fn update_last_accessed_after_retag(
+        &mut self,
+        child_tag: BorTag,
+        new_perm: Permission,
+        prot: bool,
+    ) {
+        let mut current = self.tag_mapping.get(&child_tag).unwrap();
+        let strongest_survivable = new_perm.strongest_survivable_foreign_action(prot);
+        // We walk the tree upwards, until the invariant is restored
+        while let Some(next) = self.nodes.get(current).unwrap().parent {
+            current = next;
+            // record whether we did any change (if not, the invariant is restored).
+            let any_change = self.rperms.iter_mut_all().any(|(_, map)| {
+                match map.get_mut(current) {
+                    // if there is a permission, ensure that it's latest recorded foreign access is not stronger
+                    // than the `strongest_survivable` by the newly inserted child.
+                    // Returns `true` if it changed something, and in that case, we need to continue with the parent.
+                    Some(perm) => perm.reset_last_foreign_access_after_retag(strongest_survivable),
+                    // if there is no permission yet, it is still "default lazy".
+                    // in that case, we would need to compare with that node's original default permission.
+                    // But that depended on whether that node was protected when it was created, which is no
+                    // longer the case now.
+                    // Anyways, since the node is "default", its latest recorded foreign access will default to `None`,
+                    // but we might need to continue weakening the parent.
+                    // So we return `true` here, which is definitely correct, but maybe not fully optimal.
+                    // But in cases where we are imprecise, the iteration stops at the next initialized parent anyway,
+                    // so it is likely not a huge loss in practice.
+                    None => true,
+                }
+            });
+            if any_change {
+                continue;
+            } else {
+                break;
+            }
+        }
+    }
+
     /// Deallocation requires
     /// - a pointer that permits write accesses
     /// - the absence of Strong Protectors anywhere in the allocation
@@ -735,9 +846,7 @@ impl<'tcx> Tree {
                 .get()
                 .copied()
                 .unwrap_or_else(|| LocationState::new_uninit(node.default_initial_perm));
-            // FIXME: See #3684
-            let _would_skip_if_not_for_fixme = old_state.skip_if_known_noop(access_kind, *rel_pos);
-            ContinueTraversal::Recurse
+            old_state.skip_if_known_noop(access_kind, *rel_pos)
         };
         let node_app = |perms_range: Range<u64>,
                         access_kind: AccessKind,
@@ -748,8 +857,10 @@ impl<'tcx> Tree {
 
             let old_state = perm.or_insert(LocationState::new_uninit(node.default_initial_perm));
 
-            // FIXME: See #3684
-            // old_state.record_new_access(access_kind, rel_pos);
+            // Call this function now, which ensures it is only called when
+            // `skip_if_known_noop` returns `Recurse`, due to the contract of
+            // `traverse_this_parents_children_other`.
+            old_state.record_new_access(access_kind, rel_pos);
 
             let protected = global.borrow().protected_tags.contains_key(&node.tag);
             let transition = old_state.perform_access(access_kind, rel_pos, protected)?;

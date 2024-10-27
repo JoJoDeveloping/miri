@@ -186,9 +186,24 @@ impl LiveAllocs<'_, '_> {
 
 impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
 pub trait EvalContextExt<'tcx>: MiriInterpCxExt<'tcx> {
+    fn should_run_provenance_gc(&self) -> bool {
+        let this = self.eval_context_ref();
+        match this.machine.gc_settings {
+            ProvenanceGcSettings::Disabled => false,
+            ProvenanceGcSettings::Regularly { interval } => this.machine.since_gc >= interval,
+            ProvenanceGcSettings::Heuristically =>
+            // no GC run if the last one was recently
+                this.machine.since_gc >= 75
+                    // run GC if requested, or every 10000 blocks otherwise
+                    && (this.machine.since_gc >= 10_000 || this.machine.gc_requested.get()),
+        }
+    }
+
     fn run_provenance_gc(&mut self) {
         // We collect all tags from various parts of the interpreter, but also
         let this = self.eval_context_mut();
+        this.machine.since_gc = 0;
+        this.machine.gc_requested.set(false);
 
         let mut tags = FxHashSet::default();
         let mut alloc_ids = FxHashSet::default();

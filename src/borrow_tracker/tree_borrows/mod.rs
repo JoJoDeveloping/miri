@@ -60,6 +60,9 @@ impl<'tcx> Tree {
         };
         let global = machine.borrow_tracker.as_ref().unwrap();
         let span = machine.current_span();
+        if self.tree_grew_significantly_since_last_gc() {
+            machine.request_gc();
+        }
         self.perform_access(
             tag,
             Some((range, access_kind, diagnostics::AccessCause::Explicit(access_kind))),
@@ -85,6 +88,9 @@ impl<'tcx> Tree {
         };
         let global = machine.borrow_tracker.as_ref().unwrap();
         let span = machine.current_span();
+        if self.tree_grew_significantly_since_last_gc() {
+            machine.request_gc();
+        }
         self.dealloc(tag, alloc_range(Size::ZERO, size), global, alloc_id, span)
     }
 
@@ -106,6 +112,9 @@ impl<'tcx> Tree {
         alloc_id: AllocId, // diagnostics
     ) -> InterpResult<'tcx> {
         let span = machine.current_span();
+        if self.tree_grew_significantly_since_last_gc() {
+            machine.request_gc();
+        }
         // `None` makes it the magic on-protector-end operation
         self.perform_access(tag, None, global, alloc_id, span)
     }
@@ -302,6 +311,11 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             new_perm.initial_state,
             new_perm.protector.is_some(),
         );
+
+        // Also request a GC if things are getting too large.
+        if tree_borrows.tree_grew_significantly_since_last_gc() {
+            this.machine.request_gc();
+        }
         drop(tree_borrows);
 
         // Also inform the data race model (but only if any bytes are actually affected).

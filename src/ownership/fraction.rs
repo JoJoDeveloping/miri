@@ -19,6 +19,7 @@ impl Fraction {
     pub fn is_one(&self) -> bool {
         self.num.bits() == self.denom + 1 && self.num.trailing_zeros() == Some(self.denom)
     }
+    #[allow(unused)]
     pub fn zero() -> Self {
         Self { num: 0u32.into(), denom: 0 }
     }

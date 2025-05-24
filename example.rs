@@ -2,7 +2,7 @@
 use std::mem::{ManuallyDrop, MaybeUninit};
 
 // run with
-// MIRIFLAGS="-Zmiri-ownership -Zmiri-ownership-ignore=5,6,401,403"
+// MIRIFLAGS="-Zmiri-ownership -Zmiri-ownership-ignore=8,403,405"
 // the latter ignores are for consts accessed by ghost code
 // which are there for various reasons unknown to me
 

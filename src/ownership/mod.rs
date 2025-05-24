@@ -1,6 +1,5 @@
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::Entry;
-use std::mem;
 
 use either::Either;
 use rustc_abi::Size;

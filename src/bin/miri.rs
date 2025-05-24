@@ -554,6 +554,13 @@ fn main() {
         } else if arg == "-Zmiri-tree-borrows" {
             miri_config.borrow_tracker = Some(BorrowTrackerMethod::TreeBorrows);
             miri_config.provenance_mode = ProvenanceMode::Strict;
+        } else if arg == "-Zmiri-ownership" {
+            miri_config.ownership = true;
+        } else if let Some(param) = arg.strip_prefix("-Zmiri-ownership-ignore=") {
+            let ids = parse_comma_list::<NonZero<u64>>(param).unwrap_or_else(|err| {
+                show_error!("-Zmiri-ownership-ignore requires a comma separated list of valid non-zero `u64` arguments: {err}")
+            });
+            miri_config.ownership_ignored.extend(ids.into_iter().map(miri::AllocId));
         } else if arg == "-Zmiri-disable-data-race-detector" {
             miri_config.data_race_detector = false;
             miri_config.weak_memory_emulation = false;

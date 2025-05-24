@@ -430,6 +430,44 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     }
                 }
             }
+            "miri_start_ownership_frame" => {
+                let [parent_nr] = this.check_shim(abi, Conv::Rust, link_name, args)?;
+                let Some(ownership) = this.machine.ownership.as_ref() else {
+                    throw_unsup_format!(
+                        "`miri_start_ownership_frame` requires that ownership tracking is enabled in Miri"
+                    );
+                };
+                ownership.borrow_mut().handle_start_frame(this, parent_nr)?;
+            }
+            "miri_start_ownership_postcondition" => {
+                let [] = this.check_shim(abi, Conv::Rust, link_name, args)?;
+                let Some(ownership) = this.machine.ownership.as_ref() else {
+                    throw_unsup_format!(
+                        "`miri_start_ownership_postcondition` requires that ownership tracking is enabled in Miri"
+                    );
+                };
+                ownership.borrow_mut().handle_start_postcondition(this)?;
+            }
+            "miri_owned_raw" => {
+                let [dest_ptr, owned_at_ptr, owned_size] =
+                    this.check_shim(abi, Conv::Rust, link_name, args)?;
+                let result = ownership::GlobalStateInner::handle_owned_raw(
+                    this,
+                    dest_ptr,
+                    owned_at_ptr,
+                    owned_size,
+                )?;
+                this.write_pointer(result, dest)?;
+            }
+            "miri_owned_block_token" => {
+                let [block_ptr, block_sz] = this.check_shim(abi, Conv::Rust, link_name, args)?;
+                let Some(ownership) = this.machine.ownership.as_ref() else {
+                    throw_unsup_format!(
+                        "`miri_owned_block_token` requires that ownership tracking is enabled in Miri"
+                    );
+                };
+                ownership.borrow_mut().handle_owned_block_token(this, block_ptr, block_sz)?;
+            }
 
             // Aborting the process.
             "exit" => {

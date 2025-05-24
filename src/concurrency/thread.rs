@@ -584,6 +584,7 @@ impl<'tcx> ThreadManager<'tcx> {
         &mut self,
         joined_thread_id: ThreadId,
         data_race_handler: &mut GlobalDataRaceHandler,
+        ownership: &Option<ownership::GlobalState>,
     ) -> InterpResult<'tcx> {
         if self.threads[joined_thread_id].join_status == ThreadJoinStatus::Detached {
             // On Windows this corresponds to joining on a closed handle.
@@ -594,6 +595,7 @@ impl<'tcx> ThreadManager<'tcx> {
             threads: &mut ThreadManager<'_>,
             joined_thread_id: ThreadId,
             data_race_handler: &mut GlobalDataRaceHandler,
+            ownership: &Option<ownership::GlobalState>,
         ) -> InterpResult<'tcx> {
             match data_race_handler {
                 GlobalDataRaceHandler::None => {}
@@ -601,6 +603,9 @@ impl<'tcx> ThreadManager<'tcx> {
                     data_race.thread_joined(threads, joined_thread_id),
                 GlobalDataRaceHandler::Genmc(genmc_ctx) =>
                     genmc_ctx.handle_thread_join(threads.active_thread, joined_thread_id)?,
+            }
+            if let Some(ownership) = ownership {
+                ownership.borrow_mut().join_thread(threads.active_thread(), joined_thread_id);
             }
             interp_ok(())
         }
@@ -624,13 +629,13 @@ impl<'tcx> ThreadManager<'tcx> {
                     }
                     |this, unblock: UnblockKind| {
                         assert_eq!(unblock, UnblockKind::Ready);
-                        after_join(&mut this.machine.threads, joined_thread_id, &mut this.machine.data_race)
+                        after_join(&mut this.machine.threads, joined_thread_id, &mut this.machine.data_race, &mut this.machine.ownership)
                     }
                 ),
             );
         } else {
             // The thread has already terminated - establish happens-before
-            after_join(self, joined_thread_id, data_race_handler)?;
+            after_join(self, joined_thread_id, data_race_handler, ownership)?;
         }
         interp_ok(())
     }
@@ -641,6 +646,7 @@ impl<'tcx> ThreadManager<'tcx> {
         &mut self,
         joined_thread_id: ThreadId,
         data_race_handler: &mut GlobalDataRaceHandler,
+        ownership: &Option<ownership::GlobalState>,
     ) -> InterpResult<'tcx> {
         if self.threads[joined_thread_id].join_status == ThreadJoinStatus::Joined {
             throw_ub_format!("trying to join an already joined thread");
@@ -658,7 +664,7 @@ impl<'tcx> ThreadManager<'tcx> {
             "this thread already has threads waiting for its termination"
         );
 
-        self.join_thread(joined_thread_id, data_race_handler)
+        self.join_thread(joined_thread_id, data_race_handler, ownership)
     }
 
     /// Set the name of the given thread.
@@ -946,6 +952,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             )?;
         }
 
+        // initialize ownership structure for this thread
+        if let Some(ownership) = this.machine.ownership.as_ref() {
+            ownership.borrow_mut().new_thread(new_thread_id);
+        }
+
         // Finally switch to new thread so that we can push the first stackframe.
         // After this all accesses will be treated as occurring in the new thread.
         let old_thread_id = this.machine.threads.set_active_thread_id(new_thread_id);
@@ -1109,16 +1120,22 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     #[inline]
     fn join_thread(&mut self, joined_thread_id: ThreadId) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
-        this.machine.threads.join_thread(joined_thread_id, &mut this.machine.data_race)?;
+        this.machine.threads.join_thread(
+            joined_thread_id,
+            &mut this.machine.data_race,
+            &mut this.machine.ownership,
+        )?;
         interp_ok(())
     }
 
     #[inline]
     fn join_thread_exclusive(&mut self, joined_thread_id: ThreadId) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
-        this.machine
-            .threads
-            .join_thread_exclusive(joined_thread_id, &mut this.machine.data_race)?;
+        this.machine.threads.join_thread_exclusive(
+            joined_thread_id,
+            &mut this.machine.data_race,
+            &mut this.machine.ownership,
+        )?;
         interp_ok(())
     }
 

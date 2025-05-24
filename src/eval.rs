@@ -101,6 +101,9 @@ pub struct MiriConfig {
     pub validation: ValidationMode,
     /// Determines if Stacked Borrows or Tree Borrows is enabled.
     pub borrow_tracker: Option<BorrowTrackerMethod>,
+    /// Determines if contracts ownership tracking is enabled
+    pub ownership: bool,
+    pub ownership_ignored: FxHashSet<AllocId>,
     /// Controls alignment checking.
     pub check_alignment: AlignmentCheck,
     /// Action for an op requiring communication with the host.
@@ -175,6 +178,8 @@ impl Default for MiriConfig {
             env: vec![],
             validation: ValidationMode::Shallow,
             borrow_tracker: Some(BorrowTrackerMethod::StackedBorrows),
+            ownership: false,
+            ownership_ignored: FxHashSet::default(),
             check_alignment: AlignmentCheck::Int,
             isolated_op: IsolatedOp::Reject(RejectOpWith::Abort),
             ignore_leaks: false,

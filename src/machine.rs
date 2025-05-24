@@ -446,6 +446,9 @@ pub struct MiriMachine<'tcx> {
     /// Global data for borrow tracking.
     pub borrow_tracker: Option<borrow_tracker::GlobalState>,
 
+    /// Global data for ownership tracking
+    pub ownership: Option<ownership::GlobalState>,
+
     /// Depending on settings, this will be `None`,
     /// global data for a data race detector,
     /// or the context required for running in GenMC mode.
@@ -640,6 +643,11 @@ impl<'tcx> MiriMachine<'tcx> {
         });
         let rng = StdRng::seed_from_u64(config.seed.unwrap_or(0));
         let borrow_tracker = config.borrow_tracker.map(|bt| bt.instantiate_global_state(config));
+        let ownership = if config.ownership {
+            Some(RefCell::new(ownership::GlobalStateInner::new(config.ownership_ignored.clone())))
+        } else {
+            None
+        };
         let data_race = if config.genmc_mode {
             // `genmc_ctx` persists across executions, so we don't create a new one here.
             GlobalDataRaceHandler::Genmc(genmc_ctx.unwrap())
@@ -689,6 +697,7 @@ impl<'tcx> MiriMachine<'tcx> {
         MiriMachine {
             tcx,
             borrow_tracker,
+            ownership,
             data_race,
             alloc_addresses: RefCell::new(alloc_addresses::GlobalStateInner::new(config, stack_addr)),
             // `env_vars` depends on a full interpreter so we cannot properly initialize it yet.
@@ -845,6 +854,10 @@ impl<'tcx> MiriMachine<'tcx> {
             .as_ref()
             .map(|bt| bt.borrow_mut().new_allocation(id, size, kind, &ecx.machine));
 
+        if let Some(ownership) = ecx.machine.ownership.as_ref() {
+            ownership.borrow_mut().handle_memory_alloc(&ecx.machine, id, size)?;
+        }
+
         let data_race = match &ecx.machine.data_race {
             GlobalDataRaceHandler::None => AllocDataRaceHandler::None,
             GlobalDataRaceHandler::Vclocks(data_race) =>
@@ -901,6 +914,7 @@ impl VisitProvenance for MiriMachine<'_> {
             extern_statics,
             dirs,
             borrow_tracker,
+            ownership: _,
             data_race,
             alloc_addresses,
             fds,
@@ -1398,6 +1412,11 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
             machine
                 .emit_diagnostic(NonHaltingDiagnostic::AccessedAlloc(alloc_id, AccessKind::Read));
         }
+
+        if let Some(ownership) = machine.ownership.as_ref() {
+            ownership.borrow_mut().handle_memory_access(machine, alloc_id, range, false)?;
+        }
+
         // The order of checks is deliberate, to prefer reporting a data race over a borrow tracker error.
         match &machine.data_race {
             GlobalDataRaceHandler::None => {}
@@ -1433,6 +1452,11 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
             machine
                 .emit_diagnostic(NonHaltingDiagnostic::AccessedAlloc(alloc_id, AccessKind::Write));
         }
+
+        if let Some(ownership) = machine.ownership.as_ref() {
+            ownership.borrow_mut().handle_memory_access(machine, alloc_id, range, true)?;
+        }
+
         match &machine.data_race {
             GlobalDataRaceHandler::None => {}
             GlobalDataRaceHandler::Genmc(genmc_ctx) => {
@@ -1470,6 +1494,11 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
         if machine.tracked_alloc_ids.contains(&alloc_id) {
             machine.emit_diagnostic(NonHaltingDiagnostic::FreedAlloc(alloc_id));
         }
+
+        if let Some(ownership) = machine.ownership.as_ref() {
+            ownership.borrow_mut().handle_memory_dealloc(machine, alloc_id, size)?;
+        }
+
         match &machine.data_race {
             GlobalDataRaceHandler::None => {}
             GlobalDataRaceHandler::Genmc(genmc_ctx) =>
@@ -1662,6 +1691,12 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
             // (If this ever becomes a bottleneck, we could have `push` store the previous
             // user-relevant frame and restore that here.)
             ecx.active_thread_mut().recompute_top_user_relevant_frame();
+        }
+        if let Some(ownership) = ecx.machine.ownership.as_ref() {
+            ownership.borrow_mut().on_stack_pop(
+                ecx.machine.threads.active_thread(),
+                ecx.machine.threads.active_thread_stack().len(),
+            );
         }
         let res = {
             // Move `frame`` into a sub-scope so we control when it will be dropped.

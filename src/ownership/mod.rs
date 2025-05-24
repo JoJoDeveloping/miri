@@ -4,7 +4,7 @@ use std::collections::hash_map::Entry;
 use either::Either;
 use rustc_abi::Size;
 use rustc_const_eval::interpret::{
-    AllocId, AllocRange, InterpCx, InterpResult, Pointer, interp_ok,
+    AllocId, AllocRange, GlobalAlloc, InterpCx, InterpResult, Pointer, interp_ok,
 };
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_middle::{throw_ub_format, throw_unsup_format};
@@ -194,8 +194,12 @@ impl ThreadState {
         return true;
     }
 
-    fn start_frame(&mut self, idx: usize) {
+    fn start_frame(&mut self, idx: usize) -> bool {
+        if self.call_stack.last().unwrap().real_call_stack_idx == Some(idx) {
+            return false;
+        }
         self.call_stack.push(FunctionFrame::new(idx));
+        return true;
     }
 
     fn for_topmost_frame<T, F: for<'a> FnOnce(&'a mut FunctionFrame) -> T>(&mut self, f: F) -> T {
@@ -265,6 +269,32 @@ impl GlobalStateInner {
         Self { thread_state, magic_skipped_ids, skippidy: Cell::new(false) }
     }
 
+    pub fn add_ignore(&mut self, alloc_id: AllocId) {
+        self.magic_skipped_ids.insert(alloc_id);
+    }
+
+    pub fn should_ignore<'tcx>(&self, machine: &MiriMachine<'tcx>, alloc_id: AllocId) -> bool {
+        // if we're in ghost code, ignore accesses
+        self.skippidy.get() || 
+        // if they're in the to-be-ignored list, ignore them
+        self.magic_skipped_ids.contains(&alloc_id) || {
+            // ignore accesses to read-only constants (they are "persistent")
+            // TODO this is a giant hack, and only here because such accesses sneak in everywhere,
+            // and we don't have a good way of dealing with them yet.
+            if let Some(info) = machine.tcx.try_get_global_alloc(alloc_id) {
+                match info {
+                    GlobalAlloc::Function { .. } => true,
+                    GlobalAlloc::VTable(_, _) => true,
+                    GlobalAlloc::Static(_) => false,
+                    GlobalAlloc::Memory(const_allocation) =>
+                        const_allocation.inner().mutability.is_not(),
+                }
+            } else {
+                false
+            }
+        }
+    }
+
     pub fn new_thread(&mut self, tid: ThreadId) {
         let x = self.thread_state.insert(tid, ThreadState::new());
         //TODO: we probably don't clean up all threads when we should.
@@ -317,10 +347,7 @@ impl GlobalStateInner {
         alloc_id: AllocId,
         size: Size,
     ) -> InterpResult<'tcx, ()> {
-        if self.skippidy.get() {
-            return interp_ok(());
-        }
-        if self.magic_skipped_ids.contains(&alloc_id) {
+        if self.should_ignore(this, alloc_id) {
             return interp_ok(());
         }
         // println!("Allocing {alloc_id:?} of size {size:?}");
@@ -335,10 +362,7 @@ impl GlobalStateInner {
         range: AllocRange,
         is_write: bool,
     ) -> InterpResult<'tcx, ()> {
-        if self.skippidy.get() {
-            return interp_ok(());
-        }
-        if self.magic_skipped_ids.contains(&alloc_id) {
+        if self.should_ignore(this, alloc_id) {
             return interp_ok(());
         }
         if !self.for_topmost_frame(this, |f| f.handle_access(alloc_id, range, is_write)) {
@@ -353,10 +377,7 @@ impl GlobalStateInner {
         alloc_id: AllocId,
         size: Size,
     ) -> InterpResult<'tcx, ()> {
-        if self.skippidy.get() {
-            return interp_ok(());
-        }
-        if self.magic_skipped_ids.contains(&alloc_id) {
+        if self.should_ignore(this, alloc_id) {
             return interp_ok(());
         }
         // println!("Freeing {alloc_id:?} of size {size:?}");
@@ -379,7 +400,9 @@ impl GlobalStateInner {
         }
         // this can not overflow, due to the check above
         current_stack_size -= parent_nr as usize;
-        thread_data.start_frame(current_stack_size);
+        if !thread_data.start_frame(current_stack_size) {
+            throw_unsup_format!("`miri_start_ownership_frame` called twice!");
+        }
         // println!("Started ownership frame, offset: {}", thread_data.call_stack.len() - 1);
         for offset in current_stack_size..=this.frame_idx() {
             for_all_locals_in_current_thread(
@@ -436,7 +459,6 @@ impl GlobalStateInner {
         owned_at_ptr: Pointer<Option<Provenance>>,
         owned_size: u64,
     ) -> InterpResult<'tcx, ()> {
-        let thread_data = self.thread_state.get_mut(&this.active_thread()).unwrap();
         let Ok(owned_size_s) = owned_size.try_into() else {
             throw_unsup_format!(
                 "`miri_owned_raw`: can not own {owned_size} many bytes, this is too large!"
@@ -447,10 +469,10 @@ impl GlobalStateInner {
         //     "Got Owned() call at {alloc_id:?}:{alloc_offset:?} for {owned_size:?} many bytes! (extra info: top frame's real frame is {:?})",
         //     thread_data.for_topmost_frame(|x| x.real_call_stack_idx)
         // );
-        if self.magic_skipped_ids.contains(&alloc_id) {
-            // println!("  Skipping cause it's ignored!");
+        if self.should_ignore(&this.machine, alloc_id) {
             return interp_ok(());
         }
+        let thread_data = self.thread_state.get_mut(&this.active_thread()).unwrap();
         if is_alloc_local_in_included_stack_frames(
             this,
             thread_data.for_topmost_frame(|x| x.real_call_stack_idx),
@@ -509,17 +531,16 @@ impl GlobalStateInner {
     ) -> InterpResult<'tcx, ()> {
         let block = this.read_pointer(block)?;
         let size = this.read_target_usize(size)?;
-        let thread_data = self.thread_state.get_mut(&this.active_thread()).unwrap();
         let Ok(size_s) = size.try_into() else {
             throw_unsup_format!(
                 "`miri_owned_block_token`: can not own {size} many bytes, this is too large!"
             );
         };
         let (alloc_id, alloc_offset, _) = this.ptr_get_alloc_id(block, size_s)?;
-        if self.magic_skipped_ids.contains(&alloc_id) {
-            // println!("  Skipping cause it's ignored!");
+        if self.should_ignore(&this.machine, alloc_id) {
             return interp_ok(());
         }
+        let thread_data = self.thread_state.get_mut(&this.active_thread()).unwrap();
         let alloc_info = this.get_alloc_info(alloc_id);
         if alloc_offset.bytes() != 0 {
             throw_ub_format!(

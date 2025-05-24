@@ -9,11 +9,11 @@ impl<'tcx> MiriMachine<'tcx> {
         ecx: &mut MiriInterpCx<'tcx>,
         name: &str,
         val: ImmTy<'tcx>,
-    ) -> InterpResult<'tcx> {
+    ) -> InterpResult<'tcx, AllocId> {
         let place = ecx.allocate(val.layout, MiriMemoryKind::ExternStatic.into())?;
         ecx.write_immediate(*val, &place)?;
         Self::add_extern_static(ecx, name, place.ptr());
-        interp_ok(())
+        interp_ok(ecx.ptr_get_alloc_id(place.ptr(), val.layout.size.bytes() as i64)?.0)
     }
 
     /// Zero-initialized pointer-sized extern statics are pretty common.
@@ -47,16 +47,25 @@ impl<'tcx> MiriMachine<'tcx> {
     pub fn init_extern_statics(ecx: &mut MiriInterpCx<'tcx>) -> InterpResult<'tcx> {
         // "__rust_no_alloc_shim_is_unstable"
         let val = ImmTy::from_int(0, ecx.machine.layouts.u8); // always 0, value does not matter
-        Self::alloc_extern_static(ecx, "__rust_no_alloc_shim_is_unstable", val)?;
+        let alloc_id = Self::alloc_extern_static(ecx, "__rust_no_alloc_shim_is_unstable", val)?;
+
+        //TODO hack alert
+        if let Some(ownership) = ecx.machine.ownership.as_ref() {
+            ownership.borrow_mut().add_ignore(alloc_id);
+        }
 
         // "__rust_alloc_error_handler_should_panic"
         let val = ecx.tcx.sess.opts.unstable_opts.oom.should_panic();
         let val = ImmTy::from_int(val, ecx.machine.layouts.u8);
-        Self::alloc_extern_static(
+        let alloc_id = Self::alloc_extern_static(
             ecx,
             &mangle_internal_symbol(*ecx.tcx, "__rust_alloc_error_handler_should_panic"),
             val,
         )?;
+        //TODO hack alert
+        if let Some(ownership) = ecx.machine.ownership.as_ref() {
+            ownership.borrow_mut().add_ignore(alloc_id);
+        }
 
         if ecx.target_os_is_unix() {
             // "environ" is mandated by POSIX.

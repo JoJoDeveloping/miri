@@ -112,7 +112,8 @@ pub fn owned_vec<T>(t: *const Vec<T>) -> List<ManuallyDrop<T>> {
 /// A wrapper around Vec::new that tests the contract.
 fn vec_new<T>() -> Vec<T> {
     {
-        // The spec says we can always call this.
+        // This precondition always holds, because nothing is asserted.
+        // We only call `precond()` so that we can call `postcond()` later.
         precond();
     }
     let mut res = Vec::new();

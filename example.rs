@@ -91,14 +91,16 @@ pub fn owned_vec<T>(t: *const Vec<T>) -> List<ManuallyDrop<T>> {
     let (ptr, len, cap) = ManuallyDrop::into_inner(vec).into_raw_parts();
     // Then, we compute the high-level list representation
     let mut res = Box::new(ListB::Nil);
-    // If `cap` is 0, then the pointer is dangling, and we don't actually own anything else.
     if size_of::<T>() == 0 {
+        // ZST vectors are special
         assert_eq!(cap, usize::MAX);
         for _ in (0..len).rev() {
             // the ptr value does not matter, as it's zero-sized
+            // this asserts that `T` is not uninhabited, as it should for length > 0
             res = Box::new(ListB::Cons(owned(ptr), res));
         }
     } else {
+        // If `cap` is 0, then the pointer is dangling, and we don't actually own anything else.
         if cap > 0 {
             // If `cap > 0`, then we own the block of memory which has the given size (in units of `T`).
             block(ptr, cap);

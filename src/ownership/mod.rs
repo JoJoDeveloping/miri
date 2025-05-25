@@ -29,7 +29,6 @@ enum FractionalityAssertion {
 }
 
 enum FractionalitySplit {
-    All,
     AtLeast(Fraction),
     #[allow(unused)]
     Partially,
@@ -84,7 +83,6 @@ impl FunctionFrame {
             return None;
         };
         match mode {
-            FractionalitySplit::All => self.owned.remove(ownable),
             FractionalitySplit::AtLeast(wanted) if &*frac >= &wanted => {
                 *frac -= wanted.clone();
                 if frac.is_zero() {
@@ -141,14 +139,14 @@ impl FunctionFrame {
         for off in 0..size.bytes() {
             if let Some(fr) = self.remove(
                 &Ownable::AllocedByte { alloc_id, offset: Size::from_bytes(off) },
-                &FractionalitySplit::All,
+                &FractionalitySplit::AtLeast(Fraction::one()),
             ) && fr.is_one()
             {
                 continue;
             }
             return false;
         }
-        if let Some(fr) = self.remove(&Ownable::BlockToken(alloc_id), &FractionalitySplit::All)
+        if let Some(fr) = self.remove(&Ownable::BlockToken(alloc_id), &FractionalitySplit::AtLeast(Fraction::one()))
             && fr.is_one()
         {
             return true;
@@ -418,10 +416,10 @@ impl GlobalStateInner {
                                 alloc_id: alloc_id,
                                 offset: Size::from_bytes(offset),
                             },
-                            FractionalitySplit::All,
+                            FractionalitySplit::AtLeast(Fraction::one()),
                         );
                     }
-                    thread_data.transfer(Ownable::BlockToken(alloc_id), FractionalitySplit::All);
+                    thread_data.transfer(Ownable::BlockToken(alloc_id), FractionalitySplit::AtLeast(Fraction::one()));
                 },
             );
         }
@@ -459,6 +457,10 @@ impl GlobalStateInner {
         owned_at_ptr: Pointer<Option<Provenance>>,
         owned_size: u64,
     ) -> InterpResult<'tcx, ()> {
+        if owned_size == 0{
+            // no-op semantics for ZST
+            return interp_ok(())
+        }
         let Ok(owned_size_s) = owned_size.try_into() else {
             throw_unsup_format!(
                 "`miri_owned_raw`: can not own {owned_size} many bytes, this is too large!"

@@ -3,8 +3,7 @@ use std::mem::{ManuallyDrop, MaybeUninit};
 
 // run with
 // MIRIFLAGS="-Zmiri-ownership"
-// the latter ignores are for consts accessed by ghost code
-// which are there for various reasons unknown to me
+// to support ownership tracking
 
 // declare the miri helpers we need
 unsafe extern "Rust" {
@@ -21,6 +20,7 @@ unsafe extern "Rust" {
 /// which is intended.
 /// Since this is supposed to be used in specifications, which are *not* supposed to change program state, we return everything
 /// wrapped in `ManuallyDrop`, so that one does not accidentally trigger `drop` glue after calling `owned` on e.g. a `Box`.
+/// Calling this with a zero-sized T is a memory no-op, but it still constructs a T, so if T is uninhabited it might be UB.
 pub fn owned<T>(t: *const T) -> ManuallyDrop<T> {
     let t = t as *mut T;
     let mut tmu = MaybeUninit::<T>::uninit();
@@ -86,24 +86,30 @@ impl<T> ListB<T> {
 /// It computes a mathematical abstraction, i.e. a list.
 /// It also asserts all the necessary ownership.
 pub fn owned_vec<T>(t: *const Vec<T>) -> List<ManuallyDrop<T>> {
-    // Zero-sized types are compicated, this is a simplified example ignoring them
-    assert_ne!(size_of::<T>(), 0);
     // First, we actually own the "immediate" `Vec` data.
     let vec = owned(t);
     let (ptr, len, cap) = ManuallyDrop::into_inner(vec).into_raw_parts();
     // Then, we compute the high-level list representation
     let mut res = Box::new(ListB::Nil);
     // If `cap` is 0, then the pointer is dangling, and we don't actually own anything else.
-    if cap > 0 {
-        // If `cap > 0`, then we own the block of memory which has the given size (in units of `T`).
-        block(ptr, cap);
-        // We also own a `T` for each offset in the vector up to `len`
-        for i in (0..len).rev() {
-            res = Box::new(ListB::Cons(owned(ptr.wrapping_add(i)), res));
+    if size_of::<T>() == 0 {
+        assert_eq!(cap, usize::MAX);
+        for _ in (0..len).rev() {
+            // the ptr value does not matter, as it's zero-sized
+            res = Box::new(ListB::Cons(owned(ptr), res));
         }
-        // For the ones beyond `len`, we own them as well, but we don't care what is written there.
-        for i in len..cap {
-            owned(ptr.wrapping_add(i) as *mut MaybeUninit<T>);
+    } else {
+        if cap > 0 {
+            // If `cap > 0`, then we own the block of memory which has the given size (in units of `T`).
+            block(ptr, cap);
+            // We also own a `T` for each offset in the vector up to `len`
+            for i in (0..len).rev() {
+                res = Box::new(ListB::Cons(owned(ptr.wrapping_add(i)), res));
+            }
+            // For the ones beyond `len`, we own them as well, but we don't care what is written there.
+            for i in len..cap {
+                owned(ptr.wrapping_add(i) as *mut MaybeUninit<T>);
+            }
         }
     }
     res
@@ -146,6 +152,8 @@ fn vec_push<T: Eq>(vec: &mut Vec<T>, topush: T) {
     }
 }
 
+enum Empty {}
+
 fn main() {
     // We call our functions on a test case.
     // This checks that the specifications hold at various places throughout the program.
@@ -153,4 +161,13 @@ fn main() {
     vec_push(&mut v1, 42);
     vec_push(&mut v1, 43);
     vec_push(&mut v1, 44);
+
+    let mut v2 = vec_new::<()>();
+    vec_push(&mut v2, ());
+    vec_push(&mut v2, ());
+    vec_push(&mut v2, ());
+    assert_eq!(v1.len(), v2.len());
+
+    let _v3 = vec_new::<Empty>();
+    println!("Everything worked!");
 }

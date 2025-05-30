@@ -35,7 +35,7 @@ use std::sync::{Arc, Once};
 
 use miri::{
     BacktraceStyle, BorrowTrackerMethod, GenmcConfig, GenmcCtx, MiriConfig, MiriEntryFnType,
-    ProvenanceMode, RetagFields, ValidationMode,
+    ProvenanceMode, RetagFields, TbConfig, ValidationMode,
 };
 use rustc_abi::ExternAbi;
 use rustc_data_structures::sync;
@@ -554,7 +554,13 @@ fn main() {
         } else if arg == "-Zmiri-disable-stacked-borrows" {
             miri_config.borrow_tracker = None;
         } else if arg == "-Zmiri-tree-borrows" {
-            miri_config.borrow_tracker = Some(BorrowTrackerMethod::TreeBorrows);
+            let config = TbConfig::new_default();
+            miri_config.borrow_tracker = Some(BorrowTrackerMethod::TreeBorrows(config));
+            miri_config.provenance_mode = ProvenanceMode::Strict;
+        } else if let Some(arg) = arg.strip_prefix("-Zmiri-tree-borrows=") {
+            let config = TbConfig::parse_config(arg)
+                .unwrap_or_else(|e| show_error!("Invalid arguments for -Zmiri-tree-borrows: {e}."));
+            miri_config.borrow_tracker = Some(BorrowTrackerMethod::TreeBorrows(config));
             miri_config.provenance_mode = ProvenanceMode::Strict;
         } else if arg == "-Zmiri-disable-data-race-detector" {
             miri_config.data_race_detector = false;
@@ -725,7 +731,7 @@ fn main() {
         }
     }
     // Tree Borrows implies strict provenance, and is not compatible with native calls.
-    if matches!(miri_config.borrow_tracker, Some(BorrowTrackerMethod::TreeBorrows)) {
+    if matches!(miri_config.borrow_tracker, Some(BorrowTrackerMethod::TreeBorrows(_))) {
         if miri_config.provenance_mode != ProvenanceMode::Strict {
             show_error!(
                 "Tree Borrows does not support integer-to-pointer casts, and hence requires strict provenance"

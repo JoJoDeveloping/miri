@@ -111,7 +111,7 @@ pub use crate::alloc_addresses::{EvalContextExt as _, ProvenanceMode};
 pub use crate::borrow_tracker::stacked_borrows::{
     EvalContextExt as _, Item, Permission, Stack, Stacks,
 };
-pub use crate::borrow_tracker::tree_borrows::{EvalContextExt as _, Tree};
+pub use crate::borrow_tracker::tree_borrows::{EvalContextExt as _, TbConfig, Tree};
 pub use crate::borrow_tracker::{BorTag, BorrowTrackerMethod, EvalContextExt as _, RetagFields};
 pub use crate::clock::{Instant, MonotonicClock};
 pub use crate::concurrency::cpu_affinity::MAX_CPUS;

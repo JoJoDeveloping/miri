@@ -23,6 +23,44 @@ pub use self::tree::Tree;
 
 pub type AllocState = Tree;
 
+/// This enum configures whether `UnsafeCell`s are tracked precisely or coarsely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnsafeCellPrecision {
+    /// Precise `UnsafeCell` tracking uses `visit_freeze_sensitive` to find `UnsafeCell`s, so that
+    /// only the bytes where the `UnsafeCell` actually is are marked as interior mutable.
+    Precise,
+    /// Coarese `UnsafeCell` tracking extends the interior mutablility to the entire data
+    /// behind a reference as soon as the pointed-at data has an `UnsafeCell` somewhere.
+    Coarse,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TbConfig {
+    pub unsafe_cell_precision: UnsafeCellPrecision,
+}
+
+impl TbConfig {
+    /// Creates the default configuration
+    pub fn new_default() -> Self {
+        Self { unsafe_cell_precision: UnsafeCellPrecision::Precise }
+    }
+
+    /// Parses the remainder of a `-Zmiri-tree-borrows=foo` configuration option
+    pub fn parse_config(arg: &str) -> Result<Self, String> {
+        let mut this = Self::new_default();
+        for flag in arg.split(',') {
+            match flag {
+                "unsafe-cell-tracking=precise" =>
+                    this.unsafe_cell_precision = UnsafeCellPrecision::Precise,
+                "unsafe-cell-tracking=coarse" =>
+                    this.unsafe_cell_precision = UnsafeCellPrecision::Coarse,
+                s => return Err(format!("Unknown TB config option {s}")),
+            }
+        }
+        Ok(this)
+    }
+}
+
 impl<'tcx> Tree {
     /// Create a new allocation, i.e. a new tree
     pub fn new_allocation(
@@ -212,6 +250,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     /// Returns the provenance that should be used henceforth.
     fn tb_reborrow(
         &mut self,
+        config: TbConfig,
         place: &MPlaceTy<'tcx>, // parent tag extracted from here
         ptr_size: Size,
         new_perm: NewPermission,
@@ -342,7 +381,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         assert!(new_perm.freeze_access);
 
         let protected = new_perm.protector.is_some();
-        this.visit_freeze_sensitive(place, ptr_size, |range, frozen| {
+        let mut freeze_sensitive_action = |range: AllocRange, frozen: bool| {
             has_unsafe_cell = has_unsafe_cell || !frozen;
 
             // We are only ever `Frozen` inside the frozen bits.
@@ -395,7 +434,16 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 }
             }
             interp_ok(())
-        })?;
+        };
+
+        match config.unsafe_cell_precision {
+            UnsafeCellPrecision::Precise =>
+                this.visit_freeze_sensitive(place, ptr_size, freeze_sensitive_action)?,
+            UnsafeCellPrecision::Coarse if this.type_is_freeze(place.layout.ty) =>
+                freeze_sensitive_action(alloc_range(Size::ZERO, ptr_size), true)?,
+            UnsafeCellPrecision::Coarse =>
+                freeze_sensitive_action(alloc_range(Size::ZERO, ptr_size), false)?,
+        };
 
         // Record the parent-child pair in the tree.
         tree_borrows.new_child(
@@ -415,6 +463,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
     fn tb_retag_place(
         &mut self,
+        config: TbConfig,
         place: &MPlaceTy<'tcx>,
         new_perm: NewPermission,
     ) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
@@ -440,7 +489,7 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let new_tag = this.machine.borrow_tracker.as_mut().unwrap().get_mut().new_ptr();
 
         // Compute the actual reborrow.
-        let new_prov = this.tb_reborrow(place, reborrow_size, new_perm, new_tag)?;
+        let new_prov = this.tb_reborrow(config, place, reborrow_size, new_perm, new_tag)?;
 
         // Adjust place.
         // (If the closure gets called, that means the old provenance was `Some`, and hence the new
@@ -451,12 +500,13 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     /// Retags an individual pointer, returning the retagged version.
     fn tb_retag_reference(
         &mut self,
+        config: TbConfig,
         val: &ImmTy<'tcx>,
         new_perm: NewPermission,
     ) -> InterpResult<'tcx, ImmTy<'tcx>> {
         let this = self.eval_context_mut();
         let place = this.ref_to_mplace(val)?;
-        let new_place = this.tb_retag_place(&place, new_perm)?;
+        let new_place = this.tb_retag_place(config, &place, new_perm)?;
         interp_ok(ImmTy::from_immediate(new_place.to_ref(this), val.layout))
     }
 }
@@ -467,6 +517,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     /// raw pointers are never reborrowed.
     fn tb_retag_ptr_value(
         &mut self,
+        config: TbConfig,
         kind: RetagKind,
         val: &ImmTy<'tcx>,
     ) -> InterpResult<'tcx, ImmTy<'tcx>> {
@@ -477,7 +528,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             _ => None,
         };
         if let Some(new_perm) = new_perm {
-            this.tb_retag_reference(val, new_perm)
+            this.tb_retag_reference(config, val, new_perm)
         } else {
             interp_ok(val.clone())
         }
@@ -486,13 +537,14 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     /// Retag all pointers that are stored in this place.
     fn tb_retag_place_contents(
         &mut self,
+        config: TbConfig,
         kind: RetagKind,
         place: &PlaceTy<'tcx>,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
         let options = this.machine.borrow_tracker.as_mut().unwrap().get_mut();
         let retag_fields = options.retag_fields;
-        let mut visitor = RetagVisitor { ecx: this, kind, retag_fields };
+        let mut visitor = RetagVisitor { ecx: this, kind, retag_fields, config };
         return visitor.visit_value(place);
 
         // The actual visitor.
@@ -500,6 +552,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             ecx: &'ecx mut MiriInterpCx<'tcx>,
             kind: RetagKind,
             retag_fields: RetagFields,
+            config: TbConfig,
         }
         impl<'ecx, 'tcx> RetagVisitor<'ecx, 'tcx> {
             #[inline(always)] // yes this helps in our benchmarks
@@ -510,7 +563,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             ) -> InterpResult<'tcx> {
                 if let Some(new_perm) = new_perm {
                     let val = self.ecx.read_immediate(&self.ecx.place_to_op(place)?)?;
-                    let val = self.ecx.tb_retag_reference(&val, new_perm)?;
+                    let val = self.ecx.tb_retag_reference(self.config, &val, new_perm)?;
                     self.ecx.write_immediate(*val, place)?;
                 }
                 interp_ok(())
@@ -593,7 +646,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     /// call.
     ///
     /// This is used to ensure soundness of in-place function argument/return passing.
-    fn tb_protect_place(&mut self, place: &MPlaceTy<'tcx>) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
+    fn tb_protect_place(
+        &mut self,
+        config: TbConfig,
+        place: &MPlaceTy<'tcx>,
+    ) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
         let this = self.eval_context_mut();
 
         // Retag it. With protection! That is the entire point.
@@ -612,7 +669,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             nonfreeze_access: true,
             protector: Some(ProtectorKind::StrongProtector),
         };
-        this.tb_retag_place(place, new_perm)
+        this.tb_retag_place(config, place, new_perm)
     }
 
     /// Mark the given tag as exposed. It was found on a pointer with the given AllocId.

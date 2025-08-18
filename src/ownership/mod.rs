@@ -229,6 +229,7 @@ fn for_all_locals_in_current_thread<'tcx, F: FnMut(AllocId)>(
     }
 }
 
+/*
 fn is_alloc_local_in_active_thread_stack_frame<'tcx>(
     this: &InterpCx<'tcx, MiriMachine<'tcx>>,
     offset: usize,
@@ -259,6 +260,7 @@ fn is_alloc_local_in_included_stack_frames<'tcx>(
     }
     return false;
 }
+    */
 
 impl GlobalStateInner {
     pub fn new(magic_skipped_ids: FxHashSet<AllocId>) -> Self {
@@ -475,17 +477,6 @@ impl GlobalStateInner {
             return interp_ok(());
         }
         let thread_data = self.thread_state.get_mut(&this.active_thread()).unwrap();
-        if is_alloc_local_in_included_stack_frames(
-            this,
-            thread_data.for_topmost_frame(|x| x.real_call_stack_idx),
-            alloc_id,
-        ) {
-            // println!("  Skipping cause it's local!");
-            // hack alert
-            // if we are owning locals of the current function, abort.
-            // this is because we want to e.g. call owned_vec() on an argument, but we already own the local backing the storage
-            return interp_ok(());
-        }
         for off in 0..owned_size {
             if !thread_data.transfer(
                 Ownable::AllocedByte {
